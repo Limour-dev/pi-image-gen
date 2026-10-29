@@ -12,21 +12,30 @@ import { isIP } from "node:net";
 const EXTENSION_NAME = "image-gen";
 const CONFIG_FILE = join(getAgentDir(), "image-gen.json");
 const DEFAULT_BASE_URL = "http://<api-host>:<port>";
-const DEFAULT_MODEL = "gpt-image-2";
+const DEFAULT_MODEL = "gpt-image-2.5-flare";
 const DEFAULT_SIZE = "1024x1024";
-const DEFAULT_RESPONSE_FORMAT: ResponseFormat = "b64_json";
+const DEFAULT_QUALITY = "auto";
+const DEFAULT_BACKGROUND = "auto";
+const DEFAULT_OUTPUT_FORMAT: ImageOutputFormat = "png";
 const DEFAULT_OUTPUT_DIR = ".image-gen";
 const DEFAULT_MAX_CONCURRENCY = 1;
 const MAX_CONFIGURABLE_CONCURRENCY = 8;
+const MAX_REQUEST_PARAM_FALLBACKS = 3;
+const MAX_IMAGES_PER_REQUEST = 10;
 const IMAGE2_GENERATE_PATH = "/v1/images/generations";
 const IMAGE2_EDIT_PATH = "/v1/images/edits";
 const IMAGE_FETCH_TIMEOUT_MS = 15_000;
 const MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 
-const IMAGE_SIZE_VALUES = ["1024x1024", "1024x1536", "1536x1024", "auto"] as const;
-type ImageSize = (typeof IMAGE_SIZE_VALUES)[number] | string;
+const IMAGE_SIZE_VALUES = ["auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048", "2560x1440", "3840x2160"] as const;
+const IMAGE_QUALITY_VALUES = ["auto", "low", "medium", "high", "xhigh", "max"] as const;
+const IMAGE_BACKGROUND_VALUES = ["auto", "opaque", "transparent"] as const;
+const IMAGE_OUTPUT_FORMAT_VALUES = ["png", "jpeg", "webp"] as const;
 
-type ResponseFormat = "b64_json" | "url";
+type ImageSize = string;
+type ImageQuality = string;
+type ImageBackground = string;
+type ImageOutputFormat = "png" | "jpeg" | "webp";
 type Action = "generate" | "edit";
 type ToolAction = "help" | "generate" | "edit" | "status";
 
@@ -35,7 +44,9 @@ interface ImageGenConfig {
 	apiKey?: string;
 	model?: string;
 	size?: ImageSize;
-	responseFormat?: ResponseFormat;
+	quality?: ImageQuality;
+	background?: ImageBackground;
+	outputFormat?: ImageOutputFormat;
 	outputDir?: string;
 	maxConcurrency?: number;
 }
@@ -45,7 +56,9 @@ interface ResolvedConfig {
 	apiKey: string;
 	model: string;
 	size: string;
-	responseFormat: ResponseFormat;
+	quality: string;
+	background: string;
+	outputFormat: ImageOutputFormat;
 	outputDir: string;
 	maxConcurrency: number;
 }
@@ -54,9 +67,13 @@ interface ImageRequestOptions {
 	action: Action;
 	prompt: string;
 	image?: string;
+	mask?: string;
 	outputName?: string;
 	size?: string;
-	responseFormat?: ResponseFormat;
+	quality?: string;
+	background?: string;
+	outputFormat?: string;
+	n?: number;
 	model?: string;
 }
 
@@ -65,8 +82,10 @@ interface ImageApiResponse {
 		b64_json?: string;
 		url?: string;
 	}>;
+	output_format?: string;
 	error?: {
 		message?: string;
+		param?: string;
 	};
 }
 
@@ -83,8 +102,11 @@ interface ImageResult {
 	file?: string;
 	url?: string;
 	responseFile?: string;
+	files?: string[];
 	b64?: string;
 	mimeType?: string;
+	images?: Array<{ file: string; b64: string; mimeType: string }>;
+	ignoredParams?: string[];
 }
 
 interface EditImageInput {
@@ -106,7 +128,9 @@ interface ImageGenToolDetails extends ImageResult {
 	configPath?: string;
 	model?: string;
 	size?: string;
-	responseFormat?: ResponseFormat;
+	quality?: string;
+	background?: string;
+	outputFormat?: string;
 	outputDir?: string;
 	maxConcurrency?: number;
 }
@@ -118,10 +142,14 @@ const IMAGE_GEN_TOOL_PARAMS = Type.Object({
 	}),
 	prompt: Type.Optional(Type.String({ description: "生图/编辑提示词。generate/edit 必填。" })),
 	image: Type.Optional(Type.String({ description: "edit 输入图：本地路径、URL、data URL 或 base64。" })),
+	mask: Type.Optional(Type.String({ description: "edit 局部重绘遮罩（透明区域被重绘）：本地路径、URL、data URL 或 base64。" })),
 	output_name: Type.Optional(Type.String({ description: "输出文件名；留空自动生成。" })),
 	size: Type.Optional(Type.String({ description: "可选尺寸覆盖，如 1024x1024。" })),
-	response_format: Type.Optional(StringEnum(["b64_json", "url"] as const, { description: "可选返回格式覆盖。" })),
-	model: Type.Optional(Type.String({ description: "可选模型覆盖，默认 gpt-image-2。" })),
+	quality: Type.Optional(StringEnum(IMAGE_QUALITY_VALUES, { description: "可选质量覆盖：auto/low/medium/high/xhigh/max。" })),
+	background: Type.Optional(StringEnum(IMAGE_BACKGROUND_VALUES, { description: "可选背景覆盖：auto/opaque/transparent（transparent 需 png 或 webp）。" })),
+	output_format: Type.Optional(StringEnum(IMAGE_OUTPUT_FORMAT_VALUES, { description: "可选输出格式覆盖：png/jpeg/webp。" })),
+	n: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_IMAGES_PER_REQUEST, description: "生成张数 1-10，默认 1。" })),
+	model: Type.Optional(Type.String({ description: "可选模型覆盖，默认 gpt-image-2.5-flare。" })),
 });
 
 type ImageGenToolParams = Static<typeof IMAGE_GEN_TOOL_PARAMS>;
@@ -132,7 +160,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "image_gen",
 		label: "Image Gen",
-		description: "Generate images from text or edit a supplied image with Image2. It supports general artwork, product and concept images, background or style changes, and visual assets or references for interface work. Use action=help for full input and output details; if unconfigured, direct the user to /image-gen config and do not request credentials through tool parameters.",
+		description: "Generate images from text or edit a supplied image with GPT Image models. It supports general artwork, product and concept images, background or style changes, and visual assets or references for interface work. Use action=help for full input and output details; if unconfigured, direct the user to /image-gen config and do not request credentials through tool parameters.",
 		promptSnippet: IMAGE_GEN_PROMPT_SNIPPET,
 		parameters: IMAGE_GEN_TOOL_PARAMS,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -153,7 +181,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("image-gen", {
-		description: "Image2 图片生成 / 图生图 / 配置",
+		description: "图像 API 图片生成 / 图生图 / 配置",
 		handler: async (args, ctx) => {
 			await handleImageGenCommand(pi, args, ctx);
 		},
@@ -201,13 +229,13 @@ async function handleImageGenCommand(pi: ExtensionAPI, args: string, ctx: Extens
 	const choice = await ctx.ui.select("Image Gen", [
 		"文生图",
 		"图生图 / 编辑",
-		"配置 Image2 API",
+		"配置图像 API",
 		"查看状态",
 	]);
 
 	if (choice === "文生图") await generateFlow(ctx, "");
 	if (choice === "图生图 / 编辑") await editFlow(ctx, "");
-	if (choice === "配置 Image2 API") await configFlow(pi, ctx);
+	if (choice === "配置图像 API") await configFlow(pi, ctx);
 	if (choice === "查看状态") await showStatus(ctx);
 }
 
@@ -264,7 +292,7 @@ async function executeImageGenTool(
 	}
 
 	onUpdate?.({
-		content: [{ type: "text", text: `image_gen ${action}: requesting Image2...` }],
+		content: [{ type: "text", text: `image_gen ${action}: requesting image model...` }],
 		details: { action },
 	});
 
@@ -272,24 +300,35 @@ async function executeImageGenTool(
 		action,
 		prompt,
 		image: params.image?.trim(),
+		mask: params.mask?.trim() || undefined,
 		outputName: params.output_name?.trim() || undefined,
 		size: params.size?.trim() || undefined,
-		responseFormat: params.response_format,
+		quality: params.quality,
+		background: params.background,
+		outputFormat: params.output_format,
+		n: params.n,
 		model: params.model?.trim() || undefined,
 	}, signal);
 
 	const details: ImageGenToolDetails = {
 		action,
 		file: result.file,
+		files: result.files,
 		url: result.url,
 		responseFile: result.responseFile,
 		mimeType: result.mimeType,
+		ignoredParams: result.ignoredParams,
 		model: params.model?.trim() || undefined,
 		size: params.size?.trim() || undefined,
-		responseFormat: params.response_format,
+		quality: params.quality,
+		background: params.background,
+		outputFormat: params.output_format,
 	};
 	const content: AgentToolResult<ImageGenToolDetails>["content"] = [{ type: "text", text: formatSuccess(result) }];
-	if (result.b64 && result.mimeType) {
+	for (const image of result.images ?? []) {
+		content.push({ type: "image", data: image.b64, mimeType: image.mimeType });
+	}
+	if (content.length === 1 && result.b64 && result.mimeType) {
 		content.push({ type: "image", data: result.b64, mimeType: result.mimeType });
 	}
 	return { content, details };
@@ -311,13 +350,15 @@ function buildToolHelp(): string {
 		"image_gen 使用说明：",
 		"1. 文生图：action=generate，prompt=图片描述。",
 		"2. 图生图/编辑：action=edit，image=输入图，prompt=修改要求。",
-		"3. 可生成页面参考图、图标、插画、商品图、空状态图、背景图等视觉素材。",
-		"4. 也支持概念图、产品图、换背景、风格变体等通用场景。",
-		"5. prompt 建议写清：主体、风格、比例/尺寸、色彩、用途、是否透明背景。",
-		"6. 可选参数：output_name、size、response_format、model。",
-		"7. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
-		"支持 image：本地路径、HTTP URL、data:image/...、裸 base64。",
-		"输出：b64_json/data URL/普通图片 URL 都会保存图片；URL 响应另存 *-response.json。",
+		"3. 局部重绘：action=edit，image=输入图，mask=遮罩图，prompt=重绘内容（mask 透明处会被重绘）。",
+		"4. 可生成页面参考图、图标、插画、商品图、空状态图、背景图等视觉素材。",
+		"5. 也支持概念图、产品图、换背景、风格变体等通用场景。",
+		"6. prompt 建议写清：主体、风格、比例/尺寸、色彩、用途、是否透明背景。",
+		"7. 可选参数：output_name、size、quality、background、output_format、n、model。",
+		"8. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
+		"支持 image/mask：本地路径、HTTP URL、data:image/...、裸 base64。",
+		"模型固定返回 base64（gpt-image-2.5 起不再支持 response_format:url），图片会保存到输出目录；返回多张时会全部保存。",
+		"size 支持标准尺寸或任意 WIDTHxHEIGHT（需为 16 的倍数，比例 1:3~3:1，最大 3840x2160）。",
 	].join("\n");
 }
 
@@ -329,7 +370,9 @@ async function buildToolStatus(): Promise<string> {
 		`config: ${details.configPath}`,
 		`model: ${details.model}`,
 		`size: ${details.size}`,
-		`response: ${details.responseFormat}`,
+		`quality: ${details.quality}`,
+		`background: ${details.background}`,
+		`output format: ${details.outputFormat}`,
 		`output: ${details.outputDir}`,
 		`max concurrency: ${details.maxConcurrency}`,
 		details.configured ? "可直接 generate/edit。" : "未配置，请运行 /image-gen config。",
@@ -344,7 +387,9 @@ async function buildToolStatusDetails(): Promise<ImageGenToolDetails> {
 		configPath: CONFIG_FILE,
 		model: config.model,
 		size: config.size,
-		responseFormat: config.responseFormat,
+		quality: config.quality,
+		background: config.background,
+		outputFormat: config.outputFormat,
 		outputDir: config.outputDir,
 		maxConcurrency: config.maxConcurrency,
 	};
@@ -370,11 +415,13 @@ async function generateFlow(ctx: ExtensionCommandContext, initialPrompt: string)
 
 async function editFlow(ctx: ExtensionCommandContext, initialPrompt: string): Promise<void> {
 	let image = "";
+	let mask = "";
 	let prompt = initialPrompt;
 
 	if (initialPrompt) {
 		const parsed = parseEditInlineArgs(initialPrompt);
 		image = parsed.image;
+		mask = parsed.mask || "";
 		prompt = parsed.prompt;
 	}
 
@@ -396,16 +443,17 @@ async function editFlow(ctx: ExtensionCommandContext, initialPrompt: string): Pr
 			action: "edit",
 			prompt: resolvedPrompt,
 			image,
+			mask: mask.trim() || undefined,
 			outputName: outputName?.trim() || undefined,
 		});
 		await showResult(ctx, result);
 	});
 }
 
-function parseEditInlineArgs(value: string): { image: string; prompt: string } {
+function parseEditInlineArgs(value: string): { image: string; mask?: string; prompt: string } {
 	const trimmed = value.trim();
-	const match = trimmed.match(/^(?:--image|-i)\s+(\S+)\s+([\s\S]+)$/);
-	if (match) return { image: match[1], prompt: match[2].trim() };
+	const match = trimmed.match(/^(?:--image|-i)\s+(\S+)\s+(?:--mask\s+(\S+)\s+)?([\s\S]+)$/);
+	if (match) return { image: match[1], mask: match[2], prompt: match[3].trim() };
 
 	const [first = "", ...rest] = trimmed.split(/\s+/);
 	if (looksLikeImageInput(first) && rest.length > 0) {
@@ -429,13 +477,15 @@ async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 	while (true) {
 		const config = await loadConfig();
 		await ensureOutputDir(ctx.cwd, (await resolveConfig()).outputDir);
-		const choice = await ctx.ui.select("Image2 配置", [
+		const choice = await ctx.ui.select("图像 API 配置", [
 			"查看当前配置",
 			"设置 API Base URL",
 			"设置 API Key",
 			"设置模型",
 			"设置尺寸",
-			"设置返回格式",
+			"设置质量",
+			"设置背景",
+			"设置输出格式",
 			"设置输出目录",
 			`设置最大并行数 (${normalizeMaxConcurrency(config.maxConcurrency)})`,
 			"测试连接",
@@ -482,9 +532,33 @@ async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 			continue;
 		}
 
-		if (choice === "设置返回格式") {
-			const selected = await ctx.ui.select("返回格式", ["b64_json", "url"]);
-			if (selected === "b64_json" || selected === "url") await saveConfig({ ...config, responseFormat: selected });
+		if (choice === "设置质量") {
+			const selected = await ctx.ui.select("图片质量", [...IMAGE_QUALITY_VALUES]);
+			if (selected) await saveConfig({ ...config, quality: selected });
+			continue;
+		}
+
+		if (choice === "设置背景") {
+			const selected = await ctx.ui.select("背景", [...IMAGE_BACKGROUND_VALUES, "自定义"]);
+			if (!selected) continue;
+			if (selected === "自定义") {
+				const custom = await ctx.ui.input("自定义背景", config.background || DEFAULT_BACKGROUND);
+				if (custom?.trim()) await saveConfig({ ...config, background: custom.trim() });
+			} else {
+				await saveConfig({ ...config, background: selected });
+			}
+			continue;
+		}
+
+		if (choice === "设置输出格式") {
+			const selected = await ctx.ui.select("输出格式", [...IMAGE_OUTPUT_FORMAT_VALUES, "自定义"]);
+			if (!selected) continue;
+			if (selected === "自定义") {
+				const custom = await ctx.ui.input("自定义输出格式", config.outputFormat || DEFAULT_OUTPUT_FORMAT);
+				if (custom?.trim()) await saveConfig({ ...config, outputFormat: normalizeOutputFormat(custom.trim()) });
+			} else {
+				await saveConfig({ ...config, outputFormat: normalizeOutputFormat(selected) });
+			}
 			continue;
 		}
 
@@ -576,7 +650,8 @@ function showHelp(ctx: ExtensionCommandContext): void {
 			"  /image-gen                         打开 TUI 菜单",
 			"  /image-gen generate <prompt>       文生图",
 			"  /image-gen edit <image> <prompt>   图生图 / 编辑",
-			"  /image-gen config                  配置 Image2 API",
+			"  /image-gen edit --image a.png --mask m.png <prompt>   局部重绘",
+			"  /image-gen config                  配置图像 API",
 			"  /image-gen status                  查看状态",
 			"",
 			"命令只有一层子动作；TUI 菜单最多进入一层表单。",
@@ -652,32 +727,126 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 	const config = await resolveConfig();
 	validateConfig(config);
 	let image: EditImageInput | undefined;
+	let mask: EditImageInput | undefined;
 	if (options.action === "edit") {
 		if (!options.image) throw new Error("图生图需要 image 输入");
 		image = await normalizeEditImageInput(options.image, ctx.cwd);
+		if (options.mask) {
+			mask = await normalizeEditImageInput(options.mask, ctx.cwd);
+			if (mask.buffer.length === 0) throw new Error("遮罩图不能为空");
+		}
 	}
-	return imageRequestLimiter.run(config.maxConcurrency, signal, () => requestImageUnlocked(ctx, options, config, image, signal));
+	return imageRequestLimiter.run(config.maxConcurrency, signal, () => requestImageUnlocked(ctx, options, config, image, mask, signal));
 }
 
-async function requestImageUnlocked(ctx: { cwd: string }, options: ImageRequestOptions, config: ResolvedConfig, image: EditImageInput | undefined, signal?: AbortSignal): Promise<ImageResult> {
-	let response: Response;
-	let text: string;
-	if (options.action === "edit") {
+interface RequestAttempt {
+	omitBackground?: boolean;
+	omitQuality?: boolean;
+	omitOutputFormat?: boolean;
+	omitCount?: boolean;
+}
+
+function buildRequestPayload(options: ImageRequestOptions, config: ResolvedConfig, attempt: RequestAttempt): Record<string, string> {
+	const payload: Record<string, string> = {
+		model: options.model || config.model,
+		prompt: options.prompt,
+	};
+	const size = options.size || config.size;
+	if (size) payload.size = size;
+	const quality = options.quality || config.quality;
+	if (quality && !attempt.omitQuality) payload.quality = quality;
+	const background = options.background || config.background;
+	if (background && !attempt.omitBackground) payload.background = background;
+	const outputFormat = normalizeOutputFormat(options.outputFormat || config.outputFormat);
+	if (!attempt.omitOutputFormat) payload.output_format = outputFormat;
+	const n = normalizeImageCount(options.n);
+	if (n > 1 && !attempt.omitCount) payload.n = String(n);
+	return payload;
+}
+
+type FallbackParam = "quality" | "background" | "output_format" | "n";
+
+function fallbackParam(failure: { message: string; param?: string }, payload: Record<string, string>): FallbackParam | undefined {
+	const candidates: FallbackParam[] = ["quality", "background", "output_format", "n"];
+	const hint = `${failure.param || ""} ${failure.message}`.toLowerCase();
+	for (const candidate of candidates) {
+		if (!payload[candidate]) continue;
+		if (hint.includes(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+function markOmitted(attempt: RequestAttempt, param: FallbackParam): void {
+	if (param === "quality") attempt.omitQuality = true;
+	else if (param === "background") attempt.omitBackground = true;
+	else if (param === "output_format") attempt.omitOutputFormat = true;
+	else attempt.omitCount = true;
+}
+
+async function requestImageUnlocked(
+	ctx: { cwd: string },
+	options: ImageRequestOptions,
+	config: ResolvedConfig,
+	image: EditImageInput | undefined,
+	mask: EditImageInput | undefined,
+	signal?: AbortSignal,
+): Promise<ImageResult> {
+	const attempt: RequestAttempt = {};
+	const ignoredParams: string[] = [];
+
+	for (let round = 0; round <= MAX_REQUEST_PARAM_FALLBACKS; round += 1) {
+		const payload = buildRequestPayload(options, config, attempt);
+		const { response, text } = await sendImageRequest(config, options.action, payload, image, mask, signal);
+		const failure = await describeImageFailure(response, text);
+
+		if (failure && round < MAX_REQUEST_PARAM_FALLBACKS) {
+			const param = fallbackParam(failure, payload);
+			if (param) {
+				markOmitted(attempt, param);
+				ignoredParams.push(`${param}=${payload[param]}`);
+				continue;
+			}
+		}
+
+		if (failure) throw new Error(failure.message);
+
+		let json: ImageApiResponse;
+		try {
+			json = JSON.parse(text) as ImageApiResponse;
+		} catch {
+			throw new Error(`图像 API 返回非 JSON：${text.slice(0, 300)}`);
+		}
+
+		const result = await saveImagesResponse(ctx.cwd, options, config, json);
+		return ignoredParams.length > 0 ? { ...result, ignoredParams } : result;
+	}
+
+	throw new Error("图像 API 请求失败：参数回退次数超限");
+}
+
+async function sendImageRequest(
+	config: ResolvedConfig,
+	action: Action,
+	payload: Record<string, string>,
+	image: EditImageInput | undefined,
+	mask: EditImageInput | undefined,
+	signal?: AbortSignal,
+): Promise<{ response: Response; text: string }> {
+	if (action === "edit") {
 		if (!image) throw new Error("图生图需要 image 输入");
-		const editPayload = {
-			model: options.model || config.model,
-			prompt: options.prompt,
-			size: options.size || config.size,
-			response_format: options.responseFormat || config.responseFormat,
-		};
-		const multipart = encodeMultipartForm([
-			{ name: "model", value: editPayload.model },
-			{ name: "prompt", value: editPayload.prompt },
-			{ name: "size", value: editPayload.size },
-			{ name: "response_format", value: editPayload.response_format },
-			{ name: "image", value: image.buffer, filename: image.filename, contentType: image.mimeType },
-		]);
-		response = await fetch(apiUrl(config.baseUrl, IMAGE2_EDIT_PATH), {
+		const fields: MultipartField[] = [
+			{ name: "model", value: payload.model ?? "" },
+			{ name: "prompt", value: payload.prompt ?? "" },
+		];
+		for (const [name, value] of Object.entries(payload)) {
+			if (name === "model" || name === "prompt") continue;
+			fields.push({ name, value });
+		}
+		fields.push({ name: "image[]", value: image.buffer, filename: image.filename, contentType: image.mimeType });
+		if (mask) fields.push({ name: "mask", value: mask.buffer, filename: mask.filename, contentType: mask.mimeType });
+
+		const multipart = encodeMultipartForm(fields);
+		const response = await fetch(apiUrl(config.baseUrl, IMAGE2_EDIT_PATH), {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${config.apiKey}`,
@@ -686,73 +855,114 @@ async function requestImageUnlocked(ctx: { cwd: string }, options: ImageRequestO
 			body: new Uint8Array(multipart.body),
 			signal,
 		});
-		text = await response.text();
-	} else {
-		const body: Record<string, unknown> = {
-			model: options.model || config.model,
-			prompt: options.prompt,
-			size: options.size || config.size,
-			response_format: options.responseFormat || config.responseFormat,
-		};
-		response = await fetch(apiUrl(config.baseUrl, IMAGE2_GENERATE_PATH), {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${config.apiKey}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify(body),
-			signal,
-		});
-		text = await response.text();
+		return { response, text: await response.text() };
 	}
 
-	if (!response.ok) {
-		throw new Error(`Image2 HTTP ${response.status}: ${text.slice(0, 800)}`);
+	const response = await fetch(apiUrl(config.baseUrl, IMAGE2_GENERATE_PATH), {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${config.apiKey}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify(payload),
+		signal,
+	});
+	return { response, text: await response.text() };
+}
+
+async function describeImageFailure(response: Response, text: string): Promise<{ message: string; param?: string } | undefined> {
+	if (response.ok) {
+		try {
+			const parsed = JSON.parse(text) as ImageApiResponse;
+			if (parsed.error?.message) return { message: parsed.error.message, param: parsed.error.param };
+		} catch {
+			// 非 JSON 响应交给调用方处理
+		}
+		return undefined;
 	}
 
-	let json: ImageApiResponse;
+	let message = `图像 API HTTP ${response.status}: ${text.slice(0, 800)}`;
+	let param: string | undefined;
 	try {
-		json = JSON.parse(text) as ImageApiResponse;
+		const parsed = JSON.parse(text) as ImageApiResponse & { message?: string };
+		const error = parsed.error;
+		if (error?.message) {
+			message = error.message;
+			param = error.param;
+		} else if (typeof parsed.message === "string") {
+			message = parsed.message;
+		}
 	} catch {
-		throw new Error(`Image2 返回非 JSON：${text.slice(0, 300)}`);
+		// 保留原始文本错误
 	}
+	return { message, param };
+}
 
-	if (json.error?.message) throw new Error(json.error.message);
-	const first = json.data?.[0];
-	if (!first) throw new Error("Image2 未返回 data[0]");
+async function saveImagesResponse(cwd: string, options: ImageRequestOptions, config: ResolvedConfig, json: ImageApiResponse): Promise<ImageResult> {
+	const entries = (json.data || []).filter((item) => Boolean(item?.b64_json || item?.url));
+	if (entries.length === 0) throw new Error("图像 API 未返回 data[0]");
 
-	const outputDir = await ensureOutputDir(ctx.cwd, config.outputDir);
+	const outputDir = await ensureOutputDir(cwd, config.outputDir);
+	const images: Array<{ file: string; b64: string; mimeType: string }> = [];
+	const files: string[] = [];
+	let responseFile: string | undefined;
+	let remoteUrl: string | undefined;
 
-	if (first.b64_json) {
-		const file = resolveOutputFile(outputDir, options.outputName, "png");
-		await writeFile(file, Buffer.from(first.b64_json, "base64"));
-		return { file, b64: first.b64_json, mimeType: "image/png" };
-	}
+	for (const [index, entry] of entries.entries()) {
+		const outputName = imageOutputName(options.outputName, index, entries.length);
 
-	if (first.url?.startsWith("data:")) {
-		const parsed = parseDataUrl(first.url);
-		const file = resolveOutputFile(outputDir, options.outputName, extensionFromMime(parsed.mimeType));
-		await writeFile(file, Buffer.from(parsed.data, "base64"));
-		return { file, b64: parsed.data, mimeType: parsed.mimeType };
-	}
+		if (entry.b64_json) {
+			const mimeType = detectImageMime(Buffer.from(entry.b64_json.slice(0, 32), "base64")) ||
+				outputFormatToMime(json.output_format || options.outputFormat || config.outputFormat);
+			const file = resolveOutputFile(outputDir, outputName, extensionFromMime(mimeType));
+			await writeFile(file, Buffer.from(entry.b64_json, "base64"));
+			files.push(file);
+			images.push({ file, b64: entry.b64_json, mimeType });
+			continue;
+		}
 
-	if (first.url) {
-		const responseFile = resolveOutputFile(outputDir, responseOutputName(options.outputName || "image-url"), "json");
-		await writeFile(responseFile, JSON.stringify(json, null, 2), "utf8");
-		if (/^https?:\/\//i.test(first.url)) {
-			const downloaded = await downloadImageResult(first.url);
-			if (downloaded) {
-				const file = resolveOutputFile(outputDir, options.outputName || basename(new URL(first.url).pathname), extensionFromMime(downloaded.mimeType));
-				await writeFile(file, downloaded.buffer);
-				return { file, url: first.url, responseFile, b64: downloaded.buffer.toString("base64"), mimeType: downloaded.mimeType };
+		if (entry.url?.startsWith("data:")) {
+			const parsed = parseDataUrl(entry.url);
+			const file = resolveOutputFile(outputDir, outputName, extensionFromMime(parsed.mimeType));
+			await writeFile(file, Buffer.from(parsed.data, "base64"));
+			files.push(file);
+			images.push({ file, b64: parsed.data, mimeType: parsed.mimeType });
+			continue;
+		}
+
+		if (entry.url) {
+			remoteUrl ||= entry.url;
+			responseFile ||= resolveOutputFile(outputDir, responseOutputName(options.outputName || "image-url"), "json");
+			if (/^https?:\/\//i.test(entry.url)) {
+				const downloaded = await downloadImageResult(entry.url);
+				if (downloaded) {
+					const file = resolveOutputFile(outputDir, outputName || basename(new URL(entry.url).pathname), extensionFromMime(downloaded.mimeType));
+					await writeFile(file, downloaded.buffer);
+					files.push(file);
+					images.push({ file, b64: downloaded.buffer.toString("base64"), mimeType: downloaded.mimeType });
+				}
 			}
 		}
-		return { url: first.url, responseFile };
 	}
 
-	const responseFile = resolveOutputFile(outputDir, options.outputName || "image-response", "json");
-	await writeFile(responseFile, JSON.stringify(json, null, 2), "utf8");
-	return { responseFile };
+	const first = images[0] ?? images.at(-1);
+	if (images.length === 0) {
+		const fallbackFile = responseFile || resolveOutputFile(outputDir, options.outputName || "image-response", "json");
+		await writeFile(fallbackFile, JSON.stringify(json, null, 2), "utf8");
+		return { url: remoteUrl, responseFile: fallbackFile };
+	}
+
+	if (responseFile) await writeFile(responseFile, JSON.stringify(json, null, 2), "utf8");
+
+	return {
+		file: first?.file,
+		files,
+		images,
+		url: remoteUrl,
+		responseFile,
+		b64: first?.b64,
+		mimeType: first?.mimeType,
+	};
 }
 
 async function testConnection(ctx: ExtensionCommandContext): Promise<void> {
@@ -766,7 +976,27 @@ async function testConnection(ctx: ExtensionCommandContext): Promise<void> {
 			ctx.ui.notify(`连接失败：HTTP ${response.status}`, "warning");
 			return;
 		}
-		ctx.ui.notify("连接正常：/v1/models 可访问", "info");
+
+		const text = await response.text();
+		let models: string[] = [];
+		try {
+			const json = JSON.parse(text) as ModelListResponse;
+			models = (json.data || []).map((item) => item.id).filter((id): id is string => Boolean(id?.trim()));
+		} catch {
+			// /v1/models 返回非 JSON 时只报告连通性
+		}
+
+		const lines = ["连接正常：/v1/models 可访问"];
+		const model = config.model;
+		if (models.length > 0) {
+			if (!models.includes(model)) {
+				lines.push(`⚠️ 当前模型 ${model} 不在可用列表：${models.join(", ")}`);
+			} else {
+				lines.push(`模型 ${model} 可用。`);
+			}
+		}
+		lines.push("提示：gpt-image-2.5 系列不再支持 response_format，固定返回 base64。");
+		ctx.ui.notify(lines.join("\n"), "info");
 	} catch (error) {
 		ctx.ui.notify(`连接失败：${error instanceof Error ? error.message : String(error)}`, "error");
 	}
@@ -805,7 +1035,9 @@ async function resolveConfig(): Promise<ResolvedConfig> {
 		apiKey,
 		model: process.env.IMAGE2_MODEL || process.env.IMAGE_MODEL || config.model || DEFAULT_MODEL,
 		size: process.env.IMAGE2_SIZE || process.env.IMAGE_SIZE || config.size || DEFAULT_SIZE,
-		responseFormat: normalizeResponseFormat(process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat),
+		quality: process.env.IMAGE2_QUALITY || process.env.IMAGE_QUALITY || config.quality || DEFAULT_QUALITY,
+		background: process.env.IMAGE2_BACKGROUND || process.env.IMAGE_BACKGROUND || config.background || DEFAULT_BACKGROUND,
+		outputFormat: normalizeOutputFormat(process.env.IMAGE2_OUTPUT_FORMAT || process.env.IMAGE_OUTPUT_FORMAT || config.outputFormat),
 		outputDir: process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR,
 		maxConcurrency: normalizeMaxConcurrency(process.env.IMAGE2_MAX_CONCURRENCY || process.env.IMAGE_MAX_CONCURRENCY || config.maxConcurrency),
 	};
@@ -818,27 +1050,56 @@ function normalizeMaxConcurrency(value: unknown): number {
 }
 
 function validateConfig(config: ResolvedConfig): void {
-	if (!config.baseUrl || config.baseUrl === DEFAULT_BASE_URL) throw new Error("Image2 API Base URL 未配置，请运行 /image-gen config");
-	if (!config.apiKey) throw new Error("Image2 API Key 未配置，请运行 /image-gen config");
-	if (!config.model) throw new Error("Image2 模型未配置，请运行 /image-gen config");
+	if (!config.baseUrl || config.baseUrl === DEFAULT_BASE_URL) throw new Error("图像 API Base URL 未配置，请运行 /image-gen config");
+	if (!config.apiKey) throw new Error("图像 API Key 未配置，请运行 /image-gen config");
+	if (!config.model) throw new Error("图像 API 模型未配置，请运行 /image-gen config");
 }
 
-function normalizeResponseFormat(value: unknown): ResponseFormat {
-	return value === "url" ? "url" : "b64_json";
+function normalizeOutputFormat(value: unknown): ImageOutputFormat {
+	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+	if (normalized === "jpg") return "jpeg";
+	if (normalized === "jpeg" || normalized === "webp") return normalized;
+	return DEFAULT_OUTPUT_FORMAT;
 }
 
+function normalizeImageCount(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (!Number.isFinite(parsed)) return 1;
+	return Math.max(1, Math.min(MAX_IMAGES_PER_REQUEST, Math.floor(parsed)));
+}
+
+function outputFormatToMime(value: unknown): string {
+	const format = normalizeOutputFormat(value);
+	if (format === "jpeg") return "image/jpeg";
+	if (format === "webp") return "image/webp";
+	return "image/png";
+}
+
+function imageOutputName(requested: string | undefined, index: number, total: number): string | undefined {
+	if (!requested) return undefined;
+	if (total <= 1) return requested;
+	return indexedOutputName(requested, index);
+}
+
+function indexedOutputName(name: string, index: number): string {
+	const extension = extname(name);
+	const stem = extension ? name.slice(0, -extension.length) : name;
+	return `${stem}-${index + 1}${extension}`;
+}
 function formatConfig(config: ImageGenConfig): string {
 	const envBaseUrl = process.env.IMAGE2_BASE_URL || process.env.BASE_URL;
 	const envApiKey = process.env.IMAGE2_API_KEY || process.env.API_KEY;
 	const envMaxConcurrency = process.env.IMAGE2_MAX_CONCURRENCY || process.env.IMAGE_MAX_CONCURRENCY;
 	return [
-		"Image2 配置",
+		"图像 API 配置",
 		`配置文件: ${CONFIG_FILE}`,
 		`Base URL: ${envBaseUrl || config.baseUrl || "未配置"}${envBaseUrl ? " (env)" : ""}`,
 		`API Key: ${envApiKey ? maskSecret(envApiKey) + " (env)" : maskSecret(config.apiKey)}`,
 		`Model: ${process.env.IMAGE2_MODEL || process.env.IMAGE_MODEL || config.model || DEFAULT_MODEL}`,
 		`Size: ${process.env.IMAGE2_SIZE || process.env.IMAGE_SIZE || config.size || DEFAULT_SIZE}`,
-		`Response: ${process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat || DEFAULT_RESPONSE_FORMAT}`,
+		`Quality: ${process.env.IMAGE2_QUALITY || process.env.IMAGE_QUALITY || config.quality || DEFAULT_QUALITY}`,
+		`Background: ${process.env.IMAGE2_BACKGROUND || process.env.IMAGE_BACKGROUND || config.background || DEFAULT_BACKGROUND}`,
+		`Output format: ${normalizeOutputFormat(process.env.IMAGE2_OUTPUT_FORMAT || process.env.IMAGE_OUTPUT_FORMAT || config.outputFormat)}`,
 		`Output: ${process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR}`,
 		`Max concurrency: ${normalizeMaxConcurrency(envMaxConcurrency || config.maxConcurrency)}${envMaxConcurrency ? " (env)" : ""}`,
 	].join("\n");
@@ -1055,15 +1316,30 @@ function apiUrl(baseUrl: string, path: string): string {
 
 async function showResult(ctx: ExtensionCommandContext, result: ImageResult): Promise<void> {
 	ctx.ui.notify(formatSuccess(result), "info");
-	if (!result.file) return;
-	// non-blocking push to system viewer
-	openImageWithDefaultViewer(result.file).catch(() => {});
+	const files = result.files && result.files.length > 0 ? result.files : result.file ? [result.file] : [];
+	for (const file of files) {
+		// non-blocking push to system viewer
+		openImageWithDefaultViewer(file).catch(() => {});
+	}
 }
 
-function formatSuccess(result: { file?: string; url?: string; responseFile?: string }): string {
-	if (result.file) return `✅ 图片已保存：${result.file}`;
-	if (result.url) return `✅ 图片 URL：${result.url}\n响应已保存：${result.responseFile}`;
-	return `✅ 响应已保存：${result.responseFile}`;
+function formatSuccess(result: { file?: string; files?: string[]; url?: string; responseFile?: string; ignoredParams?: string[] }): string {
+	const lines: string[] = [];
+	if (result.files && result.files.length > 1) {
+		lines.push(`✅ 已保存 ${result.files.length} 张图片：`);
+		for (const file of result.files) lines.push(`  ${file}`);
+	} else if (result.file) {
+		lines.push(`✅ 图片已保存：${result.file}`);
+	} else if (result.url) {
+		lines.push(`✅ 图片 URL：${result.url}`);
+		lines.push(`响应已保存：${result.responseFile}`);
+	} else {
+		lines.push(`✅ 响应已保存：${result.responseFile}`);
+	}
+	if (result.ignoredParams?.length) {
+		lines.push(`⚠️ 接口不支持，已忽略参数：${result.ignoredParams.join(", ")}`);
+	}
+	return lines.join("\n");
 }
 
 async function openImageWithDefaultViewer(file: string): Promise<void> {

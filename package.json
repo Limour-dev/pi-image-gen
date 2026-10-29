@@ -1,12 +1,13 @@
 {
   "name": "pi-image-gen",
   "version": "0.1.0",
-  "description": "Pi image generation extension. One /image-gen command with Image2 text-to-image and image-to-image support.",
+  "description": "Pi image generation extension. One /image-gen command with GPT Image text-to-image and image-to-image support.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
     "image-generation",
+    "gpt-image-2.5-flare",
     "gpt-image-2",
     "image2"
   ],

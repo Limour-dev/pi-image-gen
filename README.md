@@ -2,13 +2,16 @@
 
 pi 图片生成扩展。注册一个用户命令 `/image-gen`，以及原生工具：`image_gen`。
 
-当前先支持 Image2 / GPT-Image-2 兼容接口：
+支持 GPT Image 系列（`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` / `gpt-image-2`）图片接口：
 
 - 文生图：`POST /v1/images/generations`
-- 图生图 / 编辑：`POST /v1/images/edits`（优先 multipart/form-data；若后端返回 prompt/body 解析错误，会自动重试 JSON `image` / `images` data URL，兼容 chatgpt2api 等实现）
-- 默认模型：`gpt-image-2`
+- 图生图 / 编辑：`POST /v1/images/edits`（multipart，输入图字段为 `image[]`，可附带 `mask` 做局部重绘）
+- 默认模型：`gpt-image-2.5-flare`
 - 默认尺寸：`1024x1024`
-- 默认返回：`b64_json`
+- 默认质量：`auto`，默认背景：`auto`，默认输出格式：`png`
+
+> 接口变化：从 GPT Image 2 起 `response_format` 已被废弃，传它会直接 400（`Unknown parameter: 'response_format'`）。接口固定返回 `data[].b64_json`，插件会自行解码保存。对应地新增 `quality`（`low`/`medium`/`high`/`xhigh`/`max`/`auto`）、`background`（`auto`/`opaque`/`transparent`）、`output_format`（`png`/`jpeg`/`webp`）、`n`（1-10）等参数。
+> 旧配置里的 `responseFormat` 会被忽略；若后端不认识 `quality`/`background`/`output_format`，插件会自动去掉该参数重试，并在结果里提示被忽略的参数。
 
 ## 安装 / 加载
 
@@ -88,7 +91,9 @@ TUI 配置项：
 - API Key
 - 模型 ID：配置好 API Base URL 和 API Key 后，会自动请求 `/v1/models` 并提供模型列表选择；失败时回退手动输入
 - 图片尺寸
-- 返回格式：`b64_json` / `url`
+- 图片质量：`auto` / `low` / `medium` / `high` / `xhigh` / `max`
+- 背景：`auto` / `opaque` / `transparent`（transparent 需 png 或 webp）
+- 输出格式：`png` / `jpeg` / `webp`
 - 输出目录
 - 最大并行数：控制同批 `image_gen` 工具调用最多同时请求 Image2 的数量，默认 1，范围 1-8
 - 连接测试
@@ -104,9 +109,11 @@ TUI 配置项：
 ```bash
 export IMAGE2_BASE_URL="http://<api-host>:<port>" # 也兼容 http://<api-host>:<port>/v1
 export IMAGE2_API_KEY="<API_KEY>"
-export IMAGE2_MODEL="gpt-image-2"
+export IMAGE2_MODEL="gpt-image-2.5-flare"
 export IMAGE2_SIZE="1024x1024"
-export IMAGE2_RESPONSE_FORMAT="b64_json"
+export IMAGE2_QUALITY="auto"
+export IMAGE2_BACKGROUND="auto"
+export IMAGE2_OUTPUT_FORMAT="png"
 export IMAGE2_OUTPUT_DIR=".image-gen"
 export IMAGE2_MAX_CONCURRENCY="2"
 ```
@@ -116,9 +123,11 @@ export IMAGE2_MAX_CONCURRENCY="2"
 ```bash
 export BASE_URL="http://<api-host>:<port>"
 export API_KEY="<API_KEY>"
-export IMAGE_MODEL="gpt-image-2"
+export IMAGE_MODEL="gpt-image-2.5-flare"
 export IMAGE_SIZE="1024x1024"
-export IMAGE_RESPONSE_FORMAT="b64_json"
+export IMAGE_QUALITY="auto"
+export IMAGE_BACKGROUND="auto"
+export IMAGE_OUTPUT_FORMAT="png"
 export IMAGE_OUTPUT_DIR=".image-gen"
 export IMAGE_MAX_CONCURRENCY="2"
 ```
@@ -162,7 +171,11 @@ prompt           生图/编辑提示词
 image            edit 输入图：本地路径、URL、data URL 或 base64；会校验 jpeg/png/gif/webp 文件头
 output_name      输出文件名
 size             可选尺寸覆盖，如 1024x1024
-response_format  b64_json | url
+mask             局部重绘遮罩（透明区域被重绘）
+quality          auto | low | medium | high | xhigh | max
+background       auto | opaque | transparent
+output_format    png | jpeg | webp
+n                生成张数 1-10
 model            可选模型覆盖
 ```
 
@@ -198,7 +211,10 @@ model            可选模型覆盖
 
 ```text
 /image-gen edit --image ./input.png 把背景改成透明
+/image-gen edit --image ./input.png --mask ./mask.png 只重绘遮罩区域
 ```
+
+`mask` 为透明通道遮罩：透明像素处会被重绘，需与输入图同尺寸。
 
 `image` 可以是：
 
@@ -231,7 +247,7 @@ model            可选模型覆盖
 - `status`
 - `help`
 
-配置菜单内包含审查工具开关，但不新增额外 slash command。
+配置菜单包含模型 / 尺寸 / 质量 / 背景 / 输出格式 / 输出目录 / 最大并行数 / 连接测试，不新增额外 slash command。
 
 TUI 下最多进入一层表单，不再拆更多 slash command。
 
@@ -245,6 +261,6 @@ TUI 下最多进入一层表单，不再拆更多 slash command。
 
 目录会在查看配置、修改输出目录或首次生成图片时自动创建。
 
-`b64_json` 或 `data:` URL 响应会直接保存成图片，并在支持图片协议的终端里弹出 TUI 预览。
+接口固定返回 `data[].b64_json`（多张时 `data` 有多条），全部解码保存到输出目录；`output_name` 在多张时会追加 `-1`、`-2` 后缀。
 
-普通图片 URL 响应会下载真实图片保存到 `output_name`，并把完整 JSON 响应另存为 `*-response.json`。
+如果后端仍返回普通图片 URL（老的 `url` 响应），插件会下载真实图片保存到 `output_name`，并把完整 JSON 响应另存为 `*-response.json`。
